@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+TTY_PATH=${GRAPHIFY_INIT_TTY:-/dev/tty}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+open_terminal() {
+  [[ -r "$TTY_PATH" ]] || die "an interactive terminal is required"
+  exec 3<"$TTY_PATH"
+}
+
+confirm() {
+  local prompt=$1 reply
+  printf '%s [y/N] ' "$prompt"
+  IFS= read -r reply <&3 || return 1
+  case "$reply" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_uv() {
+  if command -v uv >/dev/null 2>&1; then
+    return
+  fi
+
+  confirm "uv is not installed. Install it now?" || die "uv installation declined"
+  command -v curl >/dev/null 2>&1 || die "curl is required to install uv"
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  hash -r
+  command -v uv >/dev/null 2>&1 || die "uv was installed but is not on PATH; run: source \"$HOME/.local/bin/env\""
+}
+
+ensure_graphify() {
+  if command -v graphify >/dev/null 2>&1; then
+    return
+  fi
+
+  confirm "Graphify is not installed. Install it now?" || die "Graphify installation declined"
+  uv tool install graphifyy
+  export PATH="$HOME/.local/bin:$PATH"
+  hash -r
+  command -v graphify >/dev/null 2>&1 || die "Graphify was installed but is not on PATH; run: uv tool update-shell"
+}
+
+restore_cursor() {
+  printf '\033[?25h' >&2
+}
+
+draw_menu() {
+  local selected=$1 i
+  printf 'Select agent platform:\n\n'
+  for i in "${!PLATFORM_LABELS[@]}"; do
+    if [[ "$i" -eq "$selected" ]]; then
+      printf '  \033[1;36m> %s\033[0m\n' "${PLATFORM_LABELS[$i]}"
+    else
+      printf '    %s\n' "${PLATFORM_LABELS[$i]}"
+    fi
+  done
+}
+
+select_platform() {
+  local selected=0 key rest menu_lines
+  menu_lines=$((${#PLATFORM_LABELS[@]} + 2))
+  printf '\033[?25l' >&2
+  trap restore_cursor EXIT INT TERM
+  draw_menu "$selected"
+
+  while true; do
+    IFS= read -rsn1 key <&3 || die "platform selection cancelled"
+    if [[ "$key" == $'\e' ]]; then
+      IFS= read -rsn2 rest <&3 || true
+      case "$rest" in
+        '[A') ((selected > 0)) && selected=$((selected - 1)) ;;
+        '[B') ((selected < ${#PLATFORM_LABELS[@]} - 1)) && selected=$((selected + 1)) ;;
+      esac
+      printf '\033[%dA' "$menu_lines"
+      draw_menu "$selected"
+    elif [[ -z "$key" ]]; then
+      break
+    fi
+  done
+
+  SELECTED_PLATFORM=${PLATFORM_KEYS[$selected]}
+  restore_cursor
+}
+
+install_platform() {
+  case "$SELECTED_PLATFORM" in
+    codex)
+      run_graphify "project integration" install --project --platform codex
+      run_graphify "Codex skill installation" codex install --project
+      ;;
+    claude)
+      run_graphify "project integration" install --project
+      run_graphify "Claude Code skill installation" claude install --project
+      ;;
+    gemini)
+      run_graphify "project integration" install --project --platform gemini
+      run_graphify "Gemini CLI skill installation" gemini install --project
+      ;;
+    opencode)
+      run_graphify "project integration" install --project --platform opencode
+      run_graphify "OpenCode skill installation" opencode install --project
+      ;;
+    cursor)
+      run_graphify "Cursor project integration" cursor install --project
+      ;;
+    antigravity)
+      run_graphify "Antigravity project integration" antigravity install --project
+      ;;
+    *) die "unsupported platform: $SELECTED_PLATFORM" ;;
+  esac
+}
+
+run_graphify() {
+  local step=$1 status
+  shift
+
+  if graphify "$@"; then
+    return 0
+  else
+    status=$?
+    printf 'ERROR: Graphify step failed: %s (graphify' "$step" >&2
+    printf ' %q' "$@" >&2
+    printf ')\n' >&2
+    return "$status"
+  fi
+}
+
+append_managed_block() {
+  local file=$1 content=$2 start='# >>> graphify-init >>>' end='# <<< graphify-init <<<' tmp
+
+  if [[ -f "$file" ]] && ! awk -v start="$start" -v end="$end" '
+    { comparison = $0; sub(/\r$/, "", comparison) }
+    comparison == start { if (managed) invalid = 1; managed = 1; next }
+    comparison == end { if (!managed) invalid = 1; managed = 0; next }
+    END { if (managed || invalid) exit 1 }
+  ' "$file"; then
+    die "$file contains a malformed graphify-init managed block"
+  fi
+
+  tmp=$(mktemp "${file}.tmp.XXXXXX")
+
+  if [[ -f "$file" ]]; then
+    awk -v start="$start" -v end="$end" '
+      { comparison = $0; sub(/\r$/, "", comparison) }
+      comparison == start { managed = 1; next }
+      managed && comparison == end { managed = 0; next }
+      !managed { print }
+    ' "$file" > "$tmp"
+  fi
+
+  if [[ -s "$tmp" && -n "$(tail -c 1 "$tmp")" ]]; then
+    printf '\n' >> "$tmp"
+  fi
+  printf '%s\n%s\n%s\n' "$start" "$content" "$end" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
+update_ignore_files() {
+  append_managed_block ".gitignore" "# graphify-init: local and generated state
+/graphify-out/cache/
+/graphify-out/cost.json
+/graphify-out/.graphify_*
+/graphify-out/needs_update
+/graphify-out/.needs_update"
+
+  append_managed_block ".graphifyignore" "# graphify-init: exclude installed Graphify skill sources
+**/skills/graphify/"
+}
+
+run_initialization() {
+  select_platform
+  update_ignore_files
+  printf '\nInstalling project integration for %s...\n' "$SELECTED_PLATFORM"
+  install_platform
+
+  printf '\nBuilding local code graph...\n'
+  run_graphify "code extraction" extract . --code-only
+  run_graphify "code clustering" cluster-only . --no-viz --no-label
+
+  printf '\nInstalling Git hooks...\n'
+  run_graphify "hook installation" hook install
+  run_graphify "hook status check" hook status
+
+  printf '\nGraphify initialization complete.\n'
+}
+
+main() {
+  command -v git >/dev/null 2>&1 || die "git is required"
+  git rev-parse --show-toplevel >/dev/null 2>&1 || die "run this inside a Git repository"
+
+  open_terminal
+  ensure_uv
+  ensure_graphify
+
+  local root
+  root=$(git rev-parse --show-toplevel)
+  cd "$root"
+  run_initialization
+}
+
+PLATFORM_LABELS=("Codex" "Claude Code" "Gemini CLI" "OpenCode" "Cursor" "Antigravity")
+PLATFORM_KEYS=("codex" "claude" "gemini" "opencode" "cursor" "antigravity")
+SELECTED_PLATFORM=""
+
+main "$@"
