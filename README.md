@@ -11,6 +11,14 @@ curl -fsSL https://raw.githubusercontent.com/wrallee/graphify-init/main/install.
 graphify-init
 ```
 
+For a Codex-only setup that keeps Graphify files local:
+
+```bash
+graphify-init --local
+```
+
+`--local` is supported only for Codex. It creates an ignored `AGENTS.override.md` with Graphify instructions and tells Codex to read the repository's `AGENTS.md` when one exists. Codex reads the override in place of `AGENTS.md`, so this explicit reference preserves the shared instructions. Use `graphify-init --local --no-base-agents` when the existing `AGENTS.md` should not apply.
+
 Or initialize the current repository once without installing `graphify-init`:
 
 ```bash
@@ -27,8 +35,12 @@ The script asks before installing either `uv` or Graphify. Declining either inst
 4. Lets you select Codex, Claude Code, Gemini CLI, OpenCode, Cursor, or Antigravity with the arrow keys.
 5. Installs only project-scoped Graphify skills and integration files.
 6. Updates `.gitignore` and `.graphifyignore` through idempotent managed blocks.
-7. Builds a local AST graph with no LLM calls and no visualization.
-8. Installs Graphify's Git hooks.
+7. Builds a local AST graph with no LLM calls and no visualization, unless `graphify-out/graph.json` already exists.
+8. Installs Graphify's Git hooks in the default mode.
+
+In `--local` mode, the initializer installs the Codex project skill, leaves `AGENTS.md` untouched, ignores `AGENTS.override.md`, `.codex/hooks.json`, `.codex/skills/graphify/`, `.graphifyignore`, and all of `graphify-out/`, and skips new Git hook installation. Existing hooks remain installed. The initializer does not change `.gitattributes` in this mode. A changed local `SKILL.md` is backed up as `SKILL.md.bak` before replacement.
+
+Re-running preserves an existing graph, or resumes an extraction or clustering step interrupted during initialization. Use `graphify update .` when you want to refresh a completed graph. If Graphify files are already tracked by Git, `--local` stops before changing the repository and prints the `git rm --cached` command needed to keep those files local.
 
 ## Generated-file policy
 
@@ -43,6 +55,8 @@ The initializer ignores local caches and runtime state:
 ```
 
 Portable outputs such as `graph.json`, `manifest.json`, and `GRAPH_REPORT.md` remain available to commit and share with the team.
+
+With `--local`, the entire `graphify-out/` directory is ignored instead.
 
 ## Requirements
 
