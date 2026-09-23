@@ -2,6 +2,25 @@
 set -Eeuo pipefail
 
 TTY_PATH=${GRAPHIFY_INIT_TTY:-/dev/tty}
+LOCAL_MODE=0
+BASE_AGENTS=1
+
+usage() {
+  printf 'Usage: graphify-init [--local [--no-base-agents]]\n'
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --local) LOCAL_MODE=1 ;;
+      --no-base-agents) BASE_AGENTS=0 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  [[ "$BASE_AGENTS" == 1 || "$LOCAL_MODE" == 1 ]] || die "--no-base-agents requires --local"
+}
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -93,8 +112,12 @@ select_platform() {
 install_platform() {
   case "$SELECTED_PLATFORM" in
     codex)
-      run_graphify "project integration" install --project --platform codex
-      run_graphify "Codex skill installation" codex install --project
+      if [[ "$LOCAL_MODE" == 1 ]]; then
+        install_local_codex_skill
+      else
+        run_graphify "project integration" install --project --platform codex
+        run_graphify "Codex skill installation" codex install --project
+      fi
       ;;
     claude)
       run_graphify "project integration" install --project
@@ -118,6 +141,28 @@ install_platform() {
   esac
 }
 
+install_local_codex_skill() {
+  local staging status skill=.codex/skills/graphify/SKILL.md
+  staging=$(mktemp -d)
+  if (cd "$staging" && run_graphify "project integration" install --project --platform codex >/dev/null); then
+    :
+  else
+    status=$?
+    rm -rf "$staging"
+    return "$status"
+  fi
+  if [[ ! -f "$staging/.codex/skills/graphify/SKILL.md" ]]; then
+    rm -rf "$staging"
+    die "Graphify did not install the Codex skill"
+  fi
+  mkdir -p .codex/skills/graphify
+  if [[ -f "$skill" ]] && ! cmp -s "$skill" "$staging/$skill"; then
+    cp -p "$skill" "$skill.bak"
+  fi
+  cp -R "$staging/.codex/skills/graphify/." .codex/skills/graphify/
+  rm -rf "$staging"
+}
+
 run_graphify() {
   local step=$1 status
   shift
@@ -133,17 +178,19 @@ run_graphify() {
   fi
 }
 
-append_managed_block() {
-  local file=$1 content=$2 start='# >>> graphify-init >>>' end='# <<< graphify-init <<<' tmp
-
-  if [[ -f "$file" ]] && ! awk -v start="$start" -v end="$end" '
+validate_managed_block() {
+  local file=$1 start='# >>> graphify-init >>>' end='# <<< graphify-init <<<'
+  [[ ! -f "$file" ]] || awk -v start="$start" -v end="$end" '
     { comparison = $0; sub(/\r$/, "", comparison) }
     comparison == start { if (managed) invalid = 1; managed = 1; next }
     comparison == end { if (!managed) invalid = 1; managed = 0; next }
     END { if (managed || invalid) exit 1 }
-  ' "$file"; then
-    die "$file contains a malformed graphify-init managed block"
-  fi
+  ' "$file" || die "$file contains a malformed graphify-init managed block"
+}
+
+append_managed_block() {
+  local file=$1 content=$2 dedupe=${3:-0} start='# >>> graphify-init >>>' end='# <<< graphify-init <<<' tmp line filtered added=0
+  validate_managed_block "$file"
 
   tmp=$(mktemp "${file}.tmp.XXXXXX")
 
@@ -156,53 +203,135 @@ append_managed_block() {
     ' "$file" > "$tmp"
   fi
 
+  if [[ "$dedupe" == 1 ]]; then
+    filtered=${content%%$'\n'*}
+    while IFS= read -r line; do
+      if ! grep -Fxq -- "$line" "$tmp"; then
+        filtered+=$'\n'"$line"
+        added=1
+      fi
+    done <<< "${content#*$'\n'}"
+    if [[ "$added" == 0 ]]; then
+      if [[ -f "$file" ]] && cmp -s "$tmp" "$file"; then rm "$tmp"; return; fi
+      mv "$tmp" "$file"
+      return
+    fi
+    content=$filtered
+  fi
+
+  if [[ -z "$content" ]]; then
+    if [[ -f "$file" ]] && cmp -s "$tmp" "$file"; then rm "$tmp"; return; fi
+    mv "$tmp" "$file"
+    return
+  fi
+
   if [[ -s "$tmp" && -n "$(tail -c 1 "$tmp")" ]]; then
     printf '\n' >> "$tmp"
   fi
   printf '%s\n%s\n%s\n' "$start" "$content" "$end" >> "$tmp"
+  if [[ -f "$file" ]] && cmp -s "$tmp" "$file"; then rm "$tmp"; return; fi
   mv "$tmp" "$file"
 }
 
 update_ignore_files() {
-  append_managed_block ".gitignore" "# graphify-init: local and generated state
+  local content="# graphify-init: local and generated state
 /graphify-out/cache/
 /graphify-out/cost.json
 /graphify-out/.graphify_*
 /graphify-out/needs_update
 /graphify-out/.needs_update"
+  if [[ "$LOCAL_MODE" == 1 ]]; then
+    content="# graphify-init: Codex local Graphify state
+/AGENTS.override.md
+/.codex/hooks.json
+/.codex/skills/graphify/
+/.graphifyignore
+/graphify-out/"
+  fi
+  append_managed_block ".gitignore" "$content" 1
 
   append_managed_block ".graphifyignore" "# graphify-init: exclude installed Graphify skill sources
-**/skills/graphify/"
+**/skills/graphify/" 1
+}
+
+update_local_agents() {
+  local content="# Local Graphify instructions" base_instruction='Read `AGENTS.md` for the repository instructions when it exists; this override takes precedence in Codex.'
+  if [[ "$BASE_AGENTS" == 1 ]]; then
+    content+=$'\n\n'"$base_instruction"
+  fi
+  content+=$'\n\n## graphify\n\nGenerate the local knowledge graph with `graphify extract . --code-only` if `graphify-out/graph.json` is absent.\n\nWhen the user types `/graphify`, use the installed graphify skill or instructions before doing anything else.\n\nRules:\n- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts.\n- Dirty graphify-out/ files are expected after hooks or incremental updates; only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.\n- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.\n- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).'
+
+  # Adopt a pre-existing local Graphify override without duplicating its instructions.
+  if [[ -f AGENTS.override.md ]] && [[ "$(head -n 1 AGENTS.override.md)" == '# Local Graphify instructions' ]]; then
+    if [[ "$BASE_AGENTS" == 1 ]]; then
+      append_managed_block "AGENTS.override.md" "$base_instruction"
+    else
+      append_managed_block "AGENTS.override.md" ""
+    fi
+    return
+  fi
+  append_managed_block "AGENTS.override.md" "$content"
 }
 
 run_initialization() {
-  select_platform
+  local progress=graphify-out/.graphify_init_progress phase=''
+  [[ -n "$SELECTED_PLATFORM" ]] || select_platform
+  [[ "$LOCAL_MODE" == 0 || "$SELECTED_PLATFORM" == codex ]] || die "--local supports Codex only"
   update_ignore_files
+  if [[ "$LOCAL_MODE" == 1 ]]; then update_local_agents; fi
   printf '\nInstalling project integration for %s...\n' "$SELECTED_PLATFORM"
   install_platform
 
-  printf '\nBuilding local code graph...\n'
-  run_graphify "code extraction" extract . --code-only
-  run_graphify "code clustering" cluster-only . --no-viz --no-label
+  if [[ ! -f graphify-out/graph.json || -f "$progress" ]]; then
+    printf '\nBuilding local code graph...\n'
+    if [[ -f "$progress" ]]; then phase=$(cat "$progress"); fi
+    if [[ ! -f graphify-out/graph.json || "$phase" != cluster ]]; then
+      mkdir -p graphify-out
+      printf 'extract\n' > "$progress"
+      run_graphify "code extraction" extract . --code-only
+      printf 'cluster\n' > "$progress"
+    fi
+    run_graphify "code clustering" cluster-only . --no-viz --no-label
+    rm -f "$progress"
+  fi
 
-  printf '\nInstalling Git hooks...\n'
-  run_graphify "hook installation" hook install
-  run_graphify "hook status check" hook status
+  if [[ "$LOCAL_MODE" == 0 ]]; then
+    printf '\nInstalling Git hooks...\n'
+    run_graphify "hook installation" hook install
+    run_graphify "hook status check" hook status
+  fi
 
   printf '\nGraphify initialization complete.\n'
 }
 
+ensure_local_artifacts_untracked() {
+  local tracked
+  tracked=$(git ls-files -- AGENTS.override.md .codex/hooks.json .codex/skills/graphify .graphifyignore graphify-out)
+  [[ -z "$tracked" ]] || die "Graphify files are already tracked; review and untrack them before --local with: git rm -r --cached --ignore-unmatch -- AGENTS.override.md .codex/hooks.json .codex/skills/graphify .graphifyignore graphify-out"
+}
+
 main() {
+  parse_args "$@"
   command -v git >/dev/null 2>&1 || die "git is required"
   git rev-parse --show-toplevel >/dev/null 2>&1 || die "run this inside a Git repository"
-
-  open_terminal
-  ensure_uv
-  ensure_graphify
 
   local root
   root=$(git rev-parse --show-toplevel)
   cd "$root"
+
+  open_terminal
+  if [[ "$LOCAL_MODE" == 1 ]]; then
+    select_platform
+    [[ "$SELECTED_PLATFORM" == codex ]] || die "--local supports Codex only"
+  fi
+  validate_managed_block ".gitignore"
+  validate_managed_block ".graphifyignore"
+  if [[ "$LOCAL_MODE" == 1 ]]; then
+    validate_managed_block "AGENTS.override.md"
+    ensure_local_artifacts_untracked
+  fi
+  ensure_uv
+  ensure_graphify
   run_initialization
 }
 

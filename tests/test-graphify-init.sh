@@ -103,6 +103,8 @@ write_stub() {
 
 run_script() {
   local workdir=$1 answers=$2 mode=${3:-file}
+  shift 2
+  if (($#)); then shift; fi
   printf '%s' "$answers" > "$CASE_DIR/answers"
   set +e
   if [[ "$mode" == "stdin" ]]; then
@@ -114,7 +116,7 @@ run_script() {
       GRAPHIFY_INIT_CALL_LOG="$CASE_DIR/calls.log" \
       GRAPHIFY_INIT_FAIL_STEP="${GRAPHIFY_INIT_FAIL_STEP:-}" \
       GRAPHIFY_INIT_FAKE_UV_INSTALLER="$CASE_DIR/uv-installer" \
-      bash -s < "$SCRIPT" 2>&1)
+      bash -s -- "$@" < "$SCRIPT" 2>&1)
   else
     OUTPUT=$(cd "$workdir" && env \
       HOME="$CASE_DIR/home" \
@@ -124,7 +126,7 @@ run_script() {
       GRAPHIFY_INIT_CALL_LOG="$CASE_DIR/calls.log" \
       GRAPHIFY_INIT_FAIL_STEP="${GRAPHIFY_INIT_FAIL_STEP:-}" \
       GRAPHIFY_INIT_FAKE_UV_INSTALLER="$CASE_DIR/uv-installer" \
-      bash "$SCRIPT" 2>&1)
+      bash "$SCRIPT" "$@" 2>&1)
   fi
   STATUS=$?
   set -e
@@ -315,6 +317,168 @@ test_crlf_managed_block_is_replaced_without_duplication() {
   if ! grep -Fq "old-policy" "$CASE_DIR/repo/.gitignore"; then pass "CRLF managed content is replaced"; else fail "CRLF managed content is replaced"; fi
 }
 
+test_local_codex_is_idempotent() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify \
+    'printf "%s\\n" "graphify $*" >> "$GRAPHIFY_INIT_CALL_LOG"' \
+    'if [[ "$*" == "install --project --platform codex" ]]; then mkdir -p .codex/skills/graphify; printf "skill\\n" > .codex/skills/graphify/SKILL.md; fi' \
+    'if [[ "$*" == "extract . --code-only" ]]; then mkdir -p graphify-out; printf "{}\\n" > graphify-out/graph.json; fi'
+  git -C "$CASE_DIR/repo" init -q
+  printf 'shared instruction\n' > "$CASE_DIR/repo/AGENTS.md"
+  git -C "$CASE_DIR/repo" add AGENTS.md
+
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_status 0 "local Codex initialization succeeds"
+  assert_log_equals $'graphify install --project --platform codex\ngraphify extract . --code-only\ngraphify cluster-only . --no-viz --no-label' "local mode installs skill and builds graph without hooks"
+  assert_file_equals "$CASE_DIR/repo/AGENTS.md" "shared instruction" "local mode preserves AGENTS.md"
+  if grep -Fq 'Read `AGENTS.md`' "$CASE_DIR/repo/AGENTS.override.md"; then pass "local override refers to base AGENTS.md"; else fail "local override refers to base AGENTS.md"; fi
+  for pattern in /AGENTS.override.md /.codex/hooks.json /.codex/skills/graphify/ /.graphifyignore /graphify-out/; do
+    if grep -Fxq "$pattern" "$CASE_DIR/repo/.gitignore"; then pass "local ignore includes $pattern"; else fail "local ignore includes $pattern"; fi
+  done
+  cp "$CASE_DIR/repo/.gitignore" "$CASE_DIR/first.gitignore"
+  cp "$CASE_DIR/repo/.graphifyignore" "$CASE_DIR/first.graphifyignore"
+  cp "$CASE_DIR/repo/AGENTS.override.md" "$CASE_DIR/first.override"
+  git -C "$CASE_DIR/repo" add .gitignore
+  git -C "$CASE_DIR/repo" -c user.name=test -c user.email=test@example.com commit -qm baseline
+  : > "$CASE_DIR/calls.log"
+
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_status 0 "repeated local initialization succeeds"
+  assert_log_equals 'graphify install --project --platform codex' "existing graph is not rebuilt and hooks stay untouched"
+  if cmp -s "$CASE_DIR/repo/.gitignore" "$CASE_DIR/first.gitignore" && cmp -s "$CASE_DIR/repo/.graphifyignore" "$CASE_DIR/first.graphifyignore" && cmp -s "$CASE_DIR/repo/AGENTS.override.md" "$CASE_DIR/first.override"; then pass "repeated local initialization preserves file bytes"; else fail "repeated local initialization preserves file bytes"; fi
+  if [[ -z "$(git -C "$CASE_DIR/repo" status --short)" ]]; then pass "local artifacts leave Git status clean"; else fail "local artifacts leave Git status clean"; fi
+}
+
+test_no_base_agents_adopts_existing_local_override() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify \
+    'printf "%s\\n" "graphify $*" >> "$GRAPHIFY_INIT_CALL_LOG"' \
+    'if [[ "$*" == "install --project --platform codex" ]]; then mkdir -p .codex/skills/graphify; printf "skill\\n" > .codex/skills/graphify/SKILL.md; fi'
+  git -C "$CASE_DIR/repo" init -q
+  printf 'shared instruction\n' > "$CASE_DIR/repo/AGENTS.md"
+  printf '# Local Graphify instructions\n\nexisting custom graphify rules\n' > "$CASE_DIR/repo/AGENTS.override.md"
+  printf '/AGENTS.override.md\n/.codex/hooks.json\n/.codex/skills/graphify/\n/.graphifyignore\n/graphify-out/\n' > "$CASE_DIR/repo/.gitignore"
+  mkdir -p "$CASE_DIR/repo/graphify-out"
+  printf '{}\n' > "$CASE_DIR/repo/graphify-out/graph.json"
+  cp "$CASE_DIR/repo/.gitignore" "$CASE_DIR/first.gitignore"
+  cp "$CASE_DIR/repo/AGENTS.override.md" "$CASE_DIR/first.override"
+
+  run_script "$CASE_DIR/repo" $'\n' file --local --no-base-agents
+  assert_status 0 "no-base local initialization succeeds"
+  assert_log_equals 'graphify install --project --platform codex' "no-base local mode skips existing graph"
+  if cmp -s "$CASE_DIR/repo/.gitignore" "$CASE_DIR/first.gitignore" && cmp -s "$CASE_DIR/repo/AGENTS.override.md" "$CASE_DIR/first.override"; then pass "existing local override and ignore rules are adopted"; else fail "existing local override and ignore rules are adopted"; fi
+  assert_file_equals "$CASE_DIR/repo/AGENTS.md" "shared instruction" "no-base local mode preserves AGENTS.md"
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  if grep -Fq 'Read `AGENTS.md`' "$CASE_DIR/repo/AGENTS.override.md"; then pass "legacy override can add base instruction"; else fail "legacy override can add base instruction"; fi
+  assert_count 1 '# Local Graphify instructions' "$CASE_DIR/repo/AGENTS.override.md" "legacy Graphify instructions stay unique"
+  run_script "$CASE_DIR/repo" $'\n' file --local --no-base-agents
+  if cmp -s "$CASE_DIR/repo/AGENTS.override.md" "$CASE_DIR/first.override"; then pass "no-base restores legacy override bytes"; else fail "no-base restores legacy override bytes"; fi
+}
+
+test_no_base_agents_on_new_override() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify \
+    'if [[ "$*" == "install --project --platform codex" ]]; then mkdir -p .codex/skills/graphify; printf "skill\\n" > .codex/skills/graphify/SKILL.md; fi'
+  git -C "$CASE_DIR/repo" init -q
+  run_script "$CASE_DIR/repo" $'\n' file --local --no-base-agents
+  assert_status 0 "no-base option creates local override"
+  if ! grep -Fq 'Read `AGENTS.md`' "$CASE_DIR/repo/AGENTS.override.md"; then pass "no-base override omits base instruction"; else fail "no-base override omits base instruction"; fi
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  if grep -Fq 'Read `AGENTS.md`' "$CASE_DIR/repo/AGENTS.override.md"; then pass "local override can add base instruction"; else fail "local override can add base instruction"; fi
+  run_script "$CASE_DIR/repo" $'\n' file --local --no-base-agents
+  if ! grep -Fq 'Read `AGENTS.md`' "$CASE_DIR/repo/AGENTS.override.md"; then pass "no-base option can remove base instruction"; else fail "no-base option can remove base instruction"; fi
+}
+
+test_local_skill_update_preserves_custom_copy() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify \
+    'if [[ "$*" == "install --project --platform codex" ]]; then mkdir -p .codex/skills/graphify; printf "packaged skill\\n" > .codex/skills/graphify/SKILL.md; fi'
+  git -C "$CASE_DIR/repo" init -q
+  mkdir -p "$CASE_DIR/repo/.codex/skills/graphify" "$CASE_DIR/repo/graphify-out"
+  printf 'custom skill\n' > "$CASE_DIR/repo/.codex/skills/graphify/SKILL.md"
+  printf '{}\n' > "$CASE_DIR/repo/graphify-out/graph.json"
+
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_status 0 "local skill update succeeds"
+  assert_file_equals "$CASE_DIR/repo/.codex/skills/graphify/SKILL.md" "packaged skill" "local skill receives packaged content"
+  assert_file_equals "$CASE_DIR/repo/.codex/skills/graphify/SKILL.md.bak" "custom skill" "local skill preserves custom copy"
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_file_equals "$CASE_DIR/repo/.codex/skills/graphify/SKILL.md.bak" "custom skill" "repeat run preserves custom backup"
+}
+
+test_local_retries_incomplete_graph_phase() {
+  local failed_step=$1 expected_calls=$2
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify \
+    'printf "%s\\n" "graphify $*" >> "$GRAPHIFY_INIT_CALL_LOG"' \
+    'if [[ "$*" == "install --project --platform codex" ]]; then mkdir -p .codex/skills/graphify; printf "skill\\n" > .codex/skills/graphify/SKILL.md; fi' \
+    'if [[ "$*" == "extract . --code-only" ]]; then mkdir -p graphify-out; printf "{}\\n" > graphify-out/graph.json; fi' \
+    'if [[ "$*" == "$GRAPHIFY_INIT_FAIL_STEP" ]]; then exit 42; fi'
+  git -C "$CASE_DIR/repo" init -q
+
+  GRAPHIFY_INIT_FAIL_STEP="$failed_step" run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_status 42 "$failed_step failure is reported"
+  : > "$CASE_DIR/calls.log"
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_status 0 "$failed_step rerun succeeds"
+  assert_log_equals "$expected_calls" "$failed_step rerun resumes incomplete work"
+  if [[ ! -e "$CASE_DIR/repo/graphify-out/.graphify_init_progress" ]]; then pass "$failed_step clears progress marker"; else fail "$failed_step clears progress marker"; fi
+}
+
+test_local_rejects_tracked_artifacts() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify 'exit 0'
+  git -C "$CASE_DIR/repo" init -q
+  mkdir -p "$CASE_DIR/repo/graphify-out"
+  printf '{}\n' > "$CASE_DIR/repo/graphify-out/graph.json"
+  git -C "$CASE_DIR/repo" add graphify-out/graph.json
+
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_status 1 "tracked Graphify output blocks local mode"
+  assert_output_contains 'already tracked' "tracked output failure explains why"
+  if [[ ! -e "$CASE_DIR/repo/.gitignore" && ! -e "$CASE_DIR/repo/AGENTS.override.md" ]]; then pass "tracked output check precedes writes"; else fail "tracked output check precedes writes"; fi
+}
+
+test_local_non_codex_fails_before_writes() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify 'exit 0'
+  git -C "$CASE_DIR/repo" init -q
+  run_script "$CASE_DIR/repo" $'\e[B\n' file --local
+  assert_status 1 "local non-Codex selection fails"
+  assert_output_contains '--local supports Codex only' "local mode explains Codex limitation"
+  if [[ ! -e "$CASE_DIR/repo/.gitignore" && ! -e "$CASE_DIR/repo/.graphifyignore" && ! -e "$CASE_DIR/repo/AGENTS.override.md" ]]; then pass "invalid local selection writes nothing"; else fail "invalid local selection writes nothing"; fi
+}
+
+test_local_malformed_graphifyignore_fails_before_writes() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify 'exit 0'
+  git -C "$CASE_DIR/repo" init -q
+  printf '# >>> graphify-init >>>\n' > "$CASE_DIR/repo/.graphifyignore"
+  run_script "$CASE_DIR/repo" $'\n' file --local
+  assert_status 1 "malformed graphifyignore stops local initialization"
+  if [[ ! -e "$CASE_DIR/repo/.gitignore" && ! -e "$CASE_DIR/repo/AGENTS.override.md" ]]; then pass "malformed graphifyignore writes nothing else"; else fail "malformed graphifyignore writes nothing else"; fi
+}
+
+test_default_existing_graph_skips_rebuild() {
+  new_case
+  write_stub uv 'exit 0'
+  write_stub graphify 'printf "%s\\n" "graphify $*" >> "$GRAPHIFY_INIT_CALL_LOG"'
+  git -C "$CASE_DIR/repo" init -q
+  mkdir -p "$CASE_DIR/repo/graphify-out"
+  printf '{}\n' > "$CASE_DIR/repo/graphify-out/graph.json"
+  run_script "$CASE_DIR/repo" $'\n'
+  assert_status 0 "default mode accepts existing graph"
+  assert_log_equals $'graphify install --project --platform codex\ngraphify codex install --project\ngraphify hook install\ngraphify hook status' "default mode skips existing graph rebuild"
+}
+
 test_malformed_crlf_managed_block_fails_without_data_loss() {
   local original
   new_case
@@ -391,6 +555,16 @@ test_up_arrow_stays_on_first_platform
 test_ignore_files_are_preserved_and_managed_idempotently
 test_malformed_managed_block_fails_without_data_loss
 test_crlf_managed_block_is_replaced_without_duplication
+test_local_codex_is_idempotent
+test_no_base_agents_adopts_existing_local_override
+test_no_base_agents_on_new_override
+test_local_skill_update_preserves_custom_copy
+test_local_retries_incomplete_graph_phase 'cluster-only . --no-viz --no-label' $'graphify install --project --platform codex\ngraphify cluster-only . --no-viz --no-label'
+test_local_retries_incomplete_graph_phase 'extract . --code-only' $'graphify install --project --platform codex\ngraphify extract . --code-only\ngraphify cluster-only . --no-viz --no-label'
+test_local_rejects_tracked_artifacts
+test_local_non_codex_fails_before_writes
+test_local_malformed_graphifyignore_fails_before_writes
+test_default_existing_graph_skips_rebuild
 test_malformed_crlf_managed_block_fails_without_data_loss
 test_graphify_failure_names_step_and_stops 'install --project --platform codex' 'project integration' 'codex install --project'
 test_graphify_failure_names_step_and_stops 'extract . --code-only' 'code extraction' 'cluster-only . --no-viz --no-label'
